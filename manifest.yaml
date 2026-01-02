@@ -4,7 +4,7 @@ metadata:
   author: Typer_Body
   name: MarkDown2img
   repository: 'https://github.com/TwperBody/Langbot_M2Img'
-  version: 2.1.0
+  version: 3.0.0
   description:
     en_US: Convert markdown messages in ai content to images
     zh_Hans: 将ai内容中的markdown消息进行转换成图片
@@ -44,6 +44,16 @@ spec:
         zh_Hans: 生成图片的宽度
       required: True
       default: 800
+    - name: length_of_markdown
+      type: integer
+      label:
+        en_US: max length of markdown
+        zh_Hans: markdown最大长度
+      description:
+        en_US: The max length of the generated image
+        zh_Hans: 生成图片的最大长度
+      required: True
+      default: 800
     - name: breakout
       type: boolean
       label:
@@ -74,6 +84,7 @@ spec:
         zh_Hans: 调试输出
       required: False
       default: False
+
   components:
     EventListener:
       fromDirs:

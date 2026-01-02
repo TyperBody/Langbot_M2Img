@@ -15,6 +15,8 @@ from PIL import Image
 import tempfile
 from io import BytesIO
 import math
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 #pymdown-extensions方式测试
 try:
@@ -50,6 +52,7 @@ response_text = None #全局变量，导入消息
 get_url = False
 get_markdown = 2
 side_of_markdown = 800
+max_length = 50000
 #调试输出
 test_mode = True
 #阻止回复
@@ -73,6 +76,8 @@ class config:
         global test_mode
         global breakout
         global out_photo
+        global max_length
+        max_length = config.get("length_of_markdown", 50000)
         out_photo = config.get("out_photo", False)
         breakout = config.get("breakout", True)
         get_url = config.get("get_url", False)
@@ -91,13 +96,61 @@ class config:
 
 class MarkdownToBase64Converter:
     def __init__(self):
-        self.hti = Html2Image()
-        # 设置浏览器标志以获得更好的渲染效果
-        self.hti.browser_flags = ['--hide-scrollbars', '--disable-gpu']
+        self.hti = None
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self._initialized = False
+        
+    def _ensure_initialized(self):
+        """延迟初始化 Html2Image 对象"""
+        if not self._initialized:
+            self.hti = Html2Image()
+            self.hti.browser_flags = ['--hide-scrollbars', '--disable-gpu', '--no-sandbox']
+            self._initialized = True
     
-    def convert(self, markdown_text: str) -> str:
-        """将 Markdown 文本转换为 Base64 图片，支持完整语法和高度自适应"""
+    def convert(self, markdown_text: str, timeout: int = 30) -> str:
+        """将 Markdown 文本转换为 Base64 图片，支持完整语法和高度自适应
+        
+        Args:
+            markdown_text: Markdown 文本内容
+            timeout: 超时时间（秒），默认30秒
+            
+        Returns:
+            Base64 编码的图片字符串
+        """
         try:
+            self._ensure_initialized()
+            
+            # 使用线程池执行转换，避免阻塞主线程
+            future = self.executor.submit(self._convert_sync, markdown_text)
+            
+            try:
+                result = future.result(timeout=timeout)
+                return result
+            except FutureTimeoutError:
+                future.cancel()
+                print(f"转换超时（{timeout}秒），取消操作")
+                return ""
+                
+        except Exception as e:
+            print(f"转换错误: {e}")
+            import traceback
+            traceback.print_exc()
+            return ""
+    
+    def _convert_sync(self, markdown_text: str) -> str:
+        """同步转换方法，在线程池中执行"""
+        try:
+            # 输入验证
+            if not markdown_text or not isinstance(markdown_text, str):
+                print("⚠️ 无效的输入：markdown_text 必须是非空字符串")
+                return ""
+            
+            # 限制文本长度，防止内存溢出
+            global max_length
+            if len(markdown_text) > max_length:
+                print(f"⚠️ 文本过长（{len(markdown_text)} 字符），截断到 {max_length} 字符")
+                markdown_text = markdown_text[:max_length]
+            
             # 使用临时目录避免文件冲突
             with tempfile.TemporaryDirectory() as temp_dir:
                 self.hti.output_path = temp_dir
@@ -132,6 +185,20 @@ class MarkdownToBase64Converter:
                 if not os.path.exists(temp_path):
                     temp_path = filename
                 
+                # 验证文件是否存在且有效
+                if not os.path.exists(temp_path):
+                    print("❌ 生成的图片文件不存在")
+                    return ""
+                
+                file_size = os.path.getsize(temp_path)
+                if file_size == 0:
+                    print("❌ 生成的图片文件为空")
+                    return ""
+                
+                if file_size > 15 * 1024 * 1024:  # 10MB 限制
+                    print(f"❌ 生成的图片过大（{file_size / 1024 / 1024:.2f}MB）")
+                    return ""
+                
                 # 读取图片并转换为纯 Base64
                 with open(temp_path, 'rb') as f:
                     image_data = f.read()
@@ -139,13 +206,44 @@ class MarkdownToBase64Converter:
                 # 转换为纯 Base64
                 pure_base64 = base64.b64encode(image_data).decode('utf-8')
                 
+                print(f"✅ 图片生成成功：{file_size / 1024:.2f}KB，Base64 长度：{len(pure_base64)}")
                 return pure_base64
                 
         except Exception as e:
-            print(f"转换错误: {e}")
+            print(f"同步转换错误: {e}")
             import traceback
             traceback.print_exc()
             return ""
+    
+    async def convert_async(self, markdown_text: str, timeout: int = 30) -> str:
+        """异步转换方法
+        
+        Args:
+            markdown_text: Markdown 文本内容
+            timeout: 超时时间（秒），默认30秒
+            
+        Returns:
+            Base64 编码的图片字符串
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            result = await loop.run_in_executor(
+                self.executor,
+                self.convert,
+                markdown_text,
+                timeout
+            )
+            return result
+        except Exception as e:
+            print(f"异步转换错误: {e}")
+            return ""
+    
+    def cleanup(self):
+        """清理资源"""
+        if self.executor:
+            self.executor.shutdown(wait=False)
+        self._initialized = False
+        self.hti = None
     
     def _get_extensions_and_config(self):
         """获取扩展和配置"""
@@ -458,48 +556,93 @@ class MarkdownToBase64Converter:
         """
     
     def estimate_height(self, markdown_text: str) -> int:
-        """根据内容估算所需高度"""
-        # 基础高度
-        base_height = 200
+        """根据内容估算所需高度，优化算法以提高准确性"""
+        # 基础高度（包含上下边距）
+        base_height = 100
         
         # 计算行数
         lines = markdown_text.split('\n')
         line_count = len(lines)
         
-        # 计算代码块行数
+        # 统计各种元素的数量
         code_block_lines = 0
         in_code_block = False
+        header_count = 0
+        table_rows = 0
+        list_items = 0
+        quote_lines = 0
+        empty_lines = 0
+        
         for line in lines:
-            if line.strip().startswith('```'):
+            stripped = line.strip()
+            
+            # 统计空行
+            if not stripped:
+                empty_lines += 1
+                continue
+            
+            # 统计代码块
+            if stripped.startswith('```'):
                 in_code_block = not in_code_block
                 code_block_lines += 1
             elif in_code_block:
                 code_block_lines += 1
+            
+            # 统计标题
+            elif re.match(r'^#{1,6}\s+', stripped):
+                header_count += 1
+            
+            # 统计表格
+            elif '|' in stripped and not stripped.startswith('>'):
+                table_rows += 1
+            
+            # 统计列表
+            elif re.match(r'^[\s]*[-*+]\s+', stripped) or re.match(r'^[\s]*\d+\.\s+', stripped):
+                list_items += 1
+            
+            # 统计引用
+            elif stripped.startswith('>'):
+                quote_lines += 1
         
-        # 计算普通文本行数
-        normal_lines = line_count - code_block_lines
+        # 计算普通文本行数（非代码块、非空行）
+        normal_lines = line_count - code_block_lines - empty_lines
         
-        # 估算高度
-        # 普通文本：每行约25px
-        # 代码块：每行约20px（更紧凑）
-        # 标题、列表等：额外增加高度
-        estimated_height = base_height + (normal_lines * 25) + (code_block_lines * 20)
+        # 高度计算（单位：像素）
+        # 普通文本：每行约28px（包含行间距）
+        # 代码块：每行约20px（字体较小，行间距紧凑）
+        # 标题：每个约40-60px（根据级别）
+        # 表格：每行约30px
+        # 列表项：每个约25px
+        # 引用：每行约25px
+        # 空行：每个约15px
         
-        # 根据特殊元素增加高度
-        if '|' in markdown_text:  # 表格
-            estimated_height += 200
+        estimated_height = (
+            base_height +
+            (normal_lines * 28) +
+            (code_block_lines * 20) +
+            (header_count * 50) +
+            (table_rows * 30) +
+            (list_items * 25) +
+            (quote_lines * 25) +
+            (empty_lines * 15)
+        )
         
-        if '- [' in markdown_text:  # 任务列表
-            estimated_height += 100
+        # 根据特殊元素增加额外高度
+        if table_rows > 0:
+            estimated_height += 50  # 表格边框和间距
         
-        if '> ' in markdown_text:  # 引用块
-            estimated_height += 80
+        if code_block_lines > 0:
+            estimated_height += 30  # 代码块边框和内边距
         
         # 确保最小和最大高度
-        min_height = 400
-        max_height = 5000
+        min_height = 300
+        max_height = 10000  # 提高到10000px以支持长文档
         
         estimated_height = max(min_height, min(estimated_height, max_height))
+        
+        print(f"📏 高度估算：{estimated_height}px（行数：{line_count}，代码：{code_block_lines}，标题：{header_count}，表格：{table_rows}）")
+        
+        return estimated_height
         
         print(f"估算高度: {estimated_height}px (行数: {line_count}, 代码行: {code_block_lines})")
         
@@ -508,6 +651,11 @@ class MarkdownToBase64Converter:
 class DefaultEventListener(
     EventListener,
 ):
+    def __init__(self):
+        super().__init__()
+        self.converter = None
+        self.max_retries = 2
+        
     async def initialize(self):
         await super().initialize()
         
@@ -519,6 +667,7 @@ class DefaultEventListener(
             global out_photo
             markdown_number = get_markdown
             response_text = event_context.event.response_text
+            
             if test_mode:
                 print(response_text)
             print('\n')
@@ -537,35 +686,92 @@ class DefaultEventListener(
                     have_url = True
                 
                 if is_markdown:
-                    markdown_number -=1
+                    markdown_number -= 1
                 
                 features_str = f" [{', '.join(features)}]" if features else ""
                 print(f"第{i}行: {status}{features_str} -> {repr(line)}")
 
             if markdown_number <= 0:
-                converter = MarkdownToBase64Converter()
-                #base64_image = "data:image/png;base64," + converter.convert(response_text)
-                base64_image = converter.convert(response_text)
+                # 延迟初始化转换器
+                if self.converter is None:
+                    self.converter = MarkdownToBase64Converter()
+                
+                # 使用异步转换方法，带重试机制
+                base64_image = await self._convert_with_retry(response_text)
 
                 if base64_image:
                     print(f"✅ 转换成功！Base64 长度: {len(base64_image)}")
                     if test_mode:
-                        print(base64_image)
-                    if have_url:
-                        await event_context.reply(
-                            platform_message.MessageChain([
-                                platform_message.Image(base64=base64_image),
-                                platform_message.Plain(text=url)
-                            ])
-                        )
-                    else:
-                        await event_context.reply(
-                            platform_message.MessageChain([
-                                platform_message.Image(base64=base64_image)
-                            ])
-                        )
-                    if breakout:
-                        event_context.prevent_default()
+                        print(base64_image[:100] + "..." if len(base64_image) > 100 else base64_image)
+                    
+                    try:
+                        if have_url:
+                            await event_context.reply(
+                                platform_message.MessageChain([
+                                    platform_message.Image(base64=base64_image),
+                                    platform_message.Plain(text=url)
+                                ])
+                            )
+                        else:
+                            await event_context.reply(
+                                platform_message.MessageChain([
+                                    platform_message.Image(base64=base64_image)
+                                ])
+                            )
+                        
+                        if breakout:
+                            event_context.prevent_default()
+                    except Exception as e:
+                        print(f"❌ 发送消息失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+                else:
+                    print(f"❌ 转换失败，跳过图片发送")
+    
+    async def _convert_with_retry(self, markdown_text: str, timeout: int = 30) -> str:
+        """带重试机制的转换方法
+        
+        Args:
+            markdown_text: Markdown 文本内容
+            timeout: 每次尝试的超时时间（秒）
+            
+        Returns:
+            Base64 编码的图片字符串，失败返回空字符串
+        """
+        for attempt in range(self.max_retries + 1):
+            try:
+                print(f"🔄 转换尝试 {attempt + 1}/{self.max_retries + 1}")
+                
+                # 使用异步转换
+                result = await self.converter.convert_async(markdown_text, timeout)
+                
+                if result:
+                    print(f"✅ 转换成功（尝试 {attempt + 1}）")
+                    return result
+                else:
+                    print(f"⚠️ 转换返回空结果（尝试 {attempt + 1}）")
+                    
+            except asyncio.TimeoutError:
+                print(f"⏱️ 转换超时（尝试 {attempt + 1}）")
+            except Exception as e:
+                print(f"❌ 转换异常（尝试 {attempt + 1}）: {e}")
+                import traceback
+                traceback.print_exc()
+            
+            # 如果不是最后一次尝试，等待一段时间再重试
+            if attempt < self.max_retries:
+                wait_time = (attempt + 1) * 2  # 指数退避：2秒、4秒
+                print(f"⏳ 等待 {wait_time} 秒后重试...")
+                await asyncio.sleep(wait_time)
+        
+        print(f"❌ 所有转换尝试均失败")
+        return ""
+    
+    def cleanup(self):
+        """清理资源"""
+        if self.converter:
+            self.converter.cleanup()
+            self.converter = None
                         
     def analyze_line_markdown(self, line: str) -> tuple[bool, list[str]]:
         """分析单行是否为Markdown格式"""
@@ -602,7 +808,7 @@ class DefaultEventListener(
             features.append("链接")
             if re.search(r'http', line):
                 Url = True
-           
+             
         # 检查图片 (![alt](src))
         if re.search(r'!\[.*?\]\(.*?\)', line):
             features.append("图片")
